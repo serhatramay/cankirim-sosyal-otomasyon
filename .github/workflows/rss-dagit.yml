@@ -10,6 +10,11 @@ on:
         required: false
         default: false
         type: boolean
+      force:
+        description: 'Gece molasi ve saatlik bekleme suresini yoksayarak paylas'
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: rss-sosyal-dagitim
@@ -36,6 +41,7 @@ jobs:
       - name: RSS Sosyal Dagitimini Calistir
         run: python3 sync_rss.py ${{ inputs.dry_run == true && '--dry-run' || '' }}
         env:
+          FORCE_RUN: ${{ inputs.force == true && 'true' || 'false' }}
           BLUESKY_HANDLE: ${{ secrets.BLUESKY_HANDLE }}
           BLUESKY_APP_PASSWORD: ${{ secrets.BLUESKY_APP_PASSWORD }}
           MASTODON_INSTANCE: ${{ secrets.MASTODON_INSTANCE }}

@@ -14,8 +14,16 @@ import xml.etree.ElementTree as ET
 
 RSS_URL = os.environ.get("RSS_URL", "https://cankirim.com.tr/rss.xml")
 MIN_PUBDATE_UTC = datetime.datetime(2026, 11, 12, 23, 10, 0, tzinfo=datetime.timezone.utc)
-MAX_POSTS_PER_RUN = 3
 USER_AGENT = "CankirimSosyalBot/1.0 (+https://cankirim.com.tr)"
+TSI_TZ = datetime.timezone(datetime.timedelta(hours=3))
+QUIET_START_MIN = 30        # 00:30 TSI
+QUIET_END_MIN = 8 * 60      # 08:00 TSI
+PLATFORM_LIMITS = {
+    "bluesky": {"cooldown_min": 90, "daily_cap": 10},
+    "mastodon": {"cooldown_min": 120, "daily_cap": 8},
+    "facebook": {"cooldown_min": 150, "daily_cap": 6},
+    "threads": {"cooldown_min": 120, "daily_cap": 8},
+}
 
 CATEGORY_TAG_MAP = {
     "spor": "#Spor",
@@ -47,6 +55,53 @@ SKIP_DEATH_REGEX = re.compile(
     r"vefat\s+et\w*|toprağa\s+veril\w*|cenaze\w*|intihar\w*)\b",
     re.IGNORECASE,
 )
+LOCAL_CANKIRI_REGEX = re.compile(
+    r"(çankırı|cankiri|atkaracalar|bayramören|bayramoren|çerkeş|cerkes|eldivan|"
+    r"ılgaz|ilgaz|kızılırmak|kizilirmak|korgun|kurşunlu|kursunlu|şabanözü|sabanozu|"
+    r"yapraklı|yaprakli|karatekin|çakü|tuz\s+mağarası|yaren|"
+    r"\borta\s+(ilçe|belediye|kaymakam)|\borta['’](da|dan|ya|nın)\b)",
+    re.IGNORECASE,
+)
+
+
+def parse_iso_utc(raw: str):
+    if not raw:
+        return None
+    s = raw.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    elif re.match(r".*[+-]\d{4}$", s):
+        s = s[:-2] + ":" + s[-2:]
+    try:
+        return datetime.datetime.fromisoformat(s).astimezone(datetime.timezone.utc)
+    except ValueError:
+        return None
+
+
+def summarize_timestamps(raw_timestamps: list, now_utc: datetime.datetime):
+    latest_dt = None
+    count_24h = 0
+    for raw in raw_timestamps:
+        dt = parse_iso_utc(raw)
+        if not dt:
+            continue
+        if latest_dt is None or dt > latest_dt:
+            latest_dt = dt
+        if 0 <= (now_utc - dt).total_seconds() <= 86400:
+            count_24h += 1
+    return latest_dt, count_24h
+
+
+def platform_can_post(platform: str, latest_dt, count_24h: int, now_utc: datetime.datetime, force: bool):
+    lim = PLATFORM_LIMITS[platform]
+    age_min = (now_utc - latest_dt).total_seconds() / 60.0 if latest_dt else None
+    if force:
+        return True, "forced"
+    if count_24h >= lim["daily_cap"]:
+        return False, f"daily_cap {count_24h}/{lim['daily_cap']}"
+    if age_min is not None and age_min < lim["cooldown_min"]:
+        return False, f"cooldown {age_min:.0f}m/{lim['cooldown_min']}m"
+    return True, f"ready (24h={count_24h}/{lim['daily_cap']})"
 
 
 def unwrap_url(u: str) -> str:
@@ -125,12 +180,13 @@ def fetch_rss_items():
             "pub_dt": pub_dt,
             "category": category,
             "description": description,
+            "is_local": bool(LOCAL_CANKIRI_REGEX.search(f"{title} {description}")),
         })
     items.sort(key=lambda x: x["pub_dt"])
     return items
 
 
-def get_bluesky_session_and_recent_urls(handle: str, app_password: str):
+def get_bluesky_session_and_recent_urls(handle: str, app_password: str, now_utc: datetime.datetime):
     sess = http_json(
         "https://bsky.social/xrpc/com.atproto.server.createSession",
         method="POST",
@@ -142,9 +198,13 @@ def get_bluesky_session_and_recent_urls(handle: str, app_password: str):
         f"https://public.api.bsky.app/xrpc/app.bsky.feed.getAuthorFeed?actor={urllib.parse.quote(did)}&limit=50"
     )
     urls = set()
+    timestamps = []
     for entry in feed.get("feed", []):
         post = entry.get("post") or {}
         record = post.get("record") or {}
+        ts = post.get("indexedAt") or record.get("createdAt")
+        if ts:
+            timestamps.append(ts)
         for src in (
             ((post.get("embed") or {}).get("external") or {}).get("uri"),
             ((record.get("embed") or {}).get("external") or {}).get("uri"),
@@ -158,10 +218,11 @@ def get_bluesky_session_and_recent_urls(handle: str, app_password: str):
                     urls.add(norm_url(uri))
         for m in URL_REGEX.findall(record.get("text") or ""):
             urls.add(norm_url(m))
-    return jwt, did, urls
+    latest_dt, count_24h = summarize_timestamps(timestamps, now_utc)
+    return jwt, did, urls, latest_dt, count_24h
 
 
-def get_mastodon_recent_urls(instance: str, token: str):
+def get_mastodon_recent_urls(instance: str, token: str, now_utc: datetime.datetime):
     base = instance.rstrip("/")
     auth = {"Authorization": f"Bearer {token}"}
     acct_info = http_json(f"{base}/api/v1/accounts/verify_credentials", headers=auth)
@@ -169,17 +230,21 @@ def get_mastodon_recent_urls(instance: str, token: str):
     acct = acct_info.get("acct") or acct_info.get("username") or ""
     statuses = http_json(f"{base}/api/v1/accounts/{acct_id}/statuses?limit=40", headers=auth)
     urls = set()
+    timestamps = []
     for st in statuses:
+        if st.get("created_at"):
+            timestamps.append(st["created_at"])
         content = st.get("content") or ""
         for m in URL_REGEX.findall(content):
             urls.add(norm_url(m))
         card_url = (st.get("card") or {}).get("url")
         if card_url:
             urls.add(norm_url(card_url))
-    return acct, urls
+    latest_dt, count_24h = summarize_timestamps(timestamps, now_utc)
+    return acct, urls, latest_dt, count_24h
 
 
-def get_facebook_recent_urls(page_id: str, token: str):
+def get_facebook_recent_urls(page_id: str, token: str, now_utc: datetime.datetime):
     info = http_json(
         f"https://graph.facebook.com/v21.0/{urllib.parse.quote(page_id)}?"
         + urllib.parse.urlencode({"fields": "name,username", "access_token": token})
@@ -188,23 +253,27 @@ def get_facebook_recent_urls(page_id: str, token: str):
     posts = http_json(
         f"https://graph.facebook.com/v21.0/{urllib.parse.quote(page_id)}/published_posts?"
         + urllib.parse.urlencode({
-            "fields": "id,message,attachments{unshimmed_url,url}",
+            "fields": "id,created_time,message,attachments{unshimmed_url,url}",
             "limit": "30",
             "access_token": token,
         })
     )
     urls = set()
+    timestamps = []
     for post in posts.get("data") or []:
+        if post.get("created_time"):
+            timestamps.append(post["created_time"])
         for att in (post.get("attachments") or {}).get("data") or []:
             u = att.get("unshimmed_url") or att.get("url")
             if u and "cankirim.com.tr" in u.lower():
                 urls.add(norm_url(u))
         for m in URL_REGEX.findall(post.get("message") or ""):
             urls.add(norm_url(m))
-    return fb_name, urls
+    latest_dt, count_24h = summarize_timestamps(timestamps, now_utc)
+    return fb_name, urls, latest_dt, count_24h
 
 
-def get_threads_recent_urls(user_id: str, token: str):
+def get_threads_recent_urls(user_id: str, token: str, now_utc: datetime.datetime):
     days_left = None
     try:
         dbg = http_json(
@@ -246,19 +315,23 @@ def get_threads_recent_urls(user_id: str, token: str):
     posts = http_json(
         f"https://graph.threads.net/v1.0/{urllib.parse.quote(user_id)}/threads?"
         + urllib.parse.urlencode({
-            "fields": "id,text,link_attachment_url,permalink",
+            "fields": "id,timestamp,text,link_attachment_url,permalink",
             "limit": "35",
             "access_token": token,
         })
     )
     urls = set()
+    timestamps = []
     for post in posts.get("data") or []:
+        if post.get("timestamp"):
+            timestamps.append(post["timestamp"])
         la = unwrap_url(post.get("link_attachment_url") or "")
         if la and "cankirim.com.tr" in la.lower():
             urls.add(norm_url(la))
         for m in URL_REGEX.findall(post.get("text") or ""):
             urls.add(norm_url(m))
-    return th_username, days_left, token, urls
+    latest_dt, count_24h = summarize_timestamps(timestamps, now_utc)
+    return th_username, days_left, token, urls, latest_dt, count_24h
 
 
 def fetch_article_og(url: str, fallback_desc: str):
@@ -476,10 +549,22 @@ def post_to_threads(user_id: str, token: str, item: dict, og_desc: str):
 
 def main():
     dry_run = "--dry-run" in sys.argv[1:] or os.environ.get("DRY_RUN", "").lower() == "true"
-    print(f"RSS Social Sync started (dry_run={dry_run})")
+    force_run = "--force" in sys.argv[1:] or os.environ.get("FORCE_RUN", "").lower() == "true"
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    tsi_now = now_utc.astimezone(TSI_TZ)
+    tsi_min = tsi_now.hour * 60 + tsi_now.minute
+    print(f"RSS Social Sync started (dry_run={dry_run}, force={force_run}, tsi={tsi_now:%H:%M})")
+
+    if QUIET_START_MIN <= tsi_min < QUIET_END_MIN:
+        if not dry_run and not force_run:
+            print(f"Quiet hours active ({tsi_now:%H:%M} TSI, paused 00:30-08:00 TSI). Exiting cleanly.")
+            return 0
+        if dry_run:
+            print(f"Quiet hours active ({tsi_now:%H:%M} TSI); continuing diagnostics because dry_run=True")
 
     items = fetch_rss_items()
-    print(f"RSS parsed: {len(items)} eligible items >= {MIN_PUBDATE_UTC.isoformat()}")
+    local_count = sum(1 for it in items if it["is_local"])
+    print(f"RSS parsed: {len(items)} eligible items (local={local_count}) >= {MIN_PUBDATE_UTC.isoformat()}")
 
     bsky_handle = os.environ.get("BLUESKY_HANDLE", "").strip()
     bsky_pass = os.environ.get("BLUESKY_APP_PASSWORD", "").strip()
@@ -490,42 +575,52 @@ def main():
     threads_user_id = os.environ.get("THREADS_USER_ID", "").strip()
     threads_token = os.environ.get("THREADS_ACCESS_TOKEN", "").strip()
 
-    bsky_jwt = bsky_did = None
-    bsky_urls = set()
+    platforms = []
+
     if bsky_handle and bsky_pass:
-        bsky_jwt, bsky_did, bsky_urls = get_bluesky_session_and_recent_urls(bsky_handle, bsky_pass)
-        print(f"Bluesky connected ({bsky_handle}, did={bsky_did}): {len(bsky_urls)} existing URLs detected")
+        try:
+            bsky_jwt, bsky_did, bsky_urls, bsky_latest, bsky_24h = get_bluesky_session_and_recent_urls(
+                bsky_handle, bsky_pass, now_utc
+            )
+            can_post, reason = platform_can_post("bluesky", bsky_latest, bsky_24h, now_utc, force_run)
+            print(f"Bluesky connected ({bsky_handle}, did={bsky_did}): {len(bsky_urls)} URLs, {reason}")
+            platforms.append(("bluesky", bsky_urls, can_post, lambda it, og, tg: post_to_bluesky(bsky_jwt, bsky_did, it, og[0], og[1], tg)))
+        except Exception as exc:
+            print(f"Bluesky connect ERROR: {exc}")
     else:
         print("Bluesky skipped: missing credentials")
 
-    masto_acct = None
-    masto_urls = set()
     if masto_token:
-        masto_acct, masto_urls = get_mastodon_recent_urls(masto_instance, masto_token)
-        print(f"Mastodon connected (@{masto_acct}): {len(masto_urls)} existing URLs detected")
+        try:
+            masto_acct, masto_urls, masto_latest, masto_24h = get_mastodon_recent_urls(masto_instance, masto_token, now_utc)
+            can_post, reason = platform_can_post("mastodon", masto_latest, masto_24h, now_utc, force_run)
+            print(f"Mastodon connected (@{masto_acct}): {len(masto_urls)} URLs, {reason}")
+            platforms.append(("mastodon", masto_urls, can_post, lambda it, og, tg: post_to_mastodon(masto_instance, masto_token, it, og[0], tg)))
+        except Exception as exc:
+            print(f"Mastodon connect ERROR: {exc}")
     else:
         print("Mastodon skipped: missing credentials")
 
-    fb_ready = False
-    fb_urls = set()
     if fb_page_id and fb_token:
         try:
-            fb_name, fb_urls = get_facebook_recent_urls(fb_page_id, fb_token)
-            fb_ready = True
-            print(f"Facebook connected (@{fb_name}): {len(fb_urls)} existing URLs detected")
+            fb_name, fb_urls, fb_latest, fb_24h = get_facebook_recent_urls(fb_page_id, fb_token, now_utc)
+            can_post, reason = platform_can_post("facebook", fb_latest, fb_24h, now_utc, force_run)
+            print(f"Facebook connected (@{fb_name}): {len(fb_urls)} URLs, {reason}")
+            platforms.append(("facebook", fb_urls, can_post, lambda it, og, tg: post_to_facebook(fb_page_id, fb_token, it, og[0], tg)))
         except Exception as exc:
             print(f"Facebook connect ERROR: {exc}")
     else:
         print("Facebook skipped: missing credentials")
 
-    threads_ready = False
-    threads_urls = set()
     if threads_user_id and threads_token:
         try:
-            th_name, th_days, threads_token, threads_urls = get_threads_recent_urls(threads_user_id, threads_token)
-            threads_ready = True
+            th_name, th_days, threads_token, threads_urls, th_latest, th_24h = get_threads_recent_urls(
+                threads_user_id, threads_token, now_utc
+            )
+            can_post, reason = platform_can_post("threads", th_latest, th_24h, now_utc, force_run)
             days_note = f", {th_days:.1f}d left" if th_days is not None else ""
-            print(f"Threads connected (@{th_name}{days_note}): {len(threads_urls)} existing URLs detected")
+            print(f"Threads connected (@{th_name}{days_note}): {len(threads_urls)} URLs, {reason}")
+            platforms.append(("threads", threads_urls, can_post, lambda it, og, tg: post_to_threads(threads_user_id, threads_token, it, og[0])))
         except Exception as exc:
             print(f"Threads connect ERROR: {exc}")
     else:
@@ -535,82 +630,39 @@ def main():
         print("No eligible RSS items found.")
         return 0
 
+    priority_items = sorted(items, key=lambda x: (1 if x["is_local"] else 0, x["pub_dt"]), reverse=True)
+    og_cache = {}
     posted_count = 0
-    total_failures = 0
+    attempt_count = 0
+    success_count = 0
 
-    for item in items:
-        if posted_count >= MAX_POSTS_PER_RUN:
-            print(f"Reached MAX_POSTS_PER_RUN={MAX_POSTS_PER_RUN}; remaining queued for next run.")
-            break
-
-        need_bsky = bool(bsky_jwt) and item["norm_link"] not in bsky_urls
-        need_masto = bool(masto_token) and item["norm_link"] not in masto_urls
-        need_fb = fb_ready and item["norm_link"] not in fb_urls
-        need_threads = threads_ready and item["norm_link"] not in threads_urls
-        if not need_bsky and not need_masto and not need_fb and not need_threads:
+    for plat_name, seen_urls, can_post, publisher in platforms:
+        if not can_post:
             continue
-
-        tags = build_hashtags(item["title"], item["category"])
-        print(
-            f"Pending item: {item['title']} | bsky={need_bsky} masto={need_masto} "
-            f"fb={need_fb} threads={need_threads} | tags={tags}"
-        )
-
+        selected = next((it for it in priority_items if it["norm_link"] not in seen_urls), None)
+        if not selected:
+            continue
+        print(f"Selected for {plat_name}: {selected['title']} (local={selected['is_local']})")
         if dry_run:
             posted_count += 1
             continue
-
-        og_desc, img_bytes = fetch_article_og(item["link"], item["description"])
-        attempts_for_item = 0
-        successes_for_item = 0
-
-        if need_bsky:
-            attempts_for_item += 1
-            try:
-                uri = post_to_bluesky(bsky_jwt, bsky_did, item, og_desc, img_bytes, tags)
-                print(f"  Bluesky OK: {uri}")
-                bsky_urls.add(item["norm_link"])
-                successes_for_item += 1
-            except Exception as exc:
-                print(f"  Bluesky ERROR: {exc}")
-
-        if need_masto:
-            attempts_for_item += 1
-            try:
-                url = post_to_mastodon(masto_instance, masto_token, item, og_desc, tags)
-                print(f"  Mastodon OK: {url}")
-                masto_urls.add(item["norm_link"])
-                successes_for_item += 1
-            except Exception as exc:
-                print(f"  Mastodon ERROR: {exc}")
-
-        if need_fb:
-            attempts_for_item += 1
-            try:
-                fb_post_id = post_to_facebook(fb_page_id, fb_token, item, og_desc, tags)
-                print(f"  Facebook OK: {fb_post_id}")
-                fb_urls.add(item["norm_link"])
-                successes_for_item += 1
-            except Exception as exc:
-                print(f"  Facebook ERROR: {exc}")
-
-        if need_threads:
-            attempts_for_item += 1
-            try:
-                th_link = post_to_threads(threads_user_id, threads_token, item, og_desc)
-                print(f"  Threads OK: {th_link}")
-                threads_urls.add(item["norm_link"])
-                successes_for_item += 1
-            except Exception as exc:
-                print(f"  Threads ERROR: {exc}")
-
-        if attempts_for_item > 0 and successes_for_item == 0:
-            total_failures += 1
-        else:
+        link = selected["link"]
+        if link not in og_cache:
+            og_cache[link] = fetch_article_og(link, selected["description"])
+        tags = build_hashtags(selected["title"], selected["category"])
+        attempt_count += 1
+        try:
+            res_ref = publisher(selected, og_cache[link], tags)
+            print(f"  {plat_name} OK: {res_ref}")
+            seen_urls.add(selected["norm_link"])
             posted_count += 1
+            success_count += 1
+        except Exception as exc:
+            print(f"  {plat_name} ERROR: {exc}")
 
-    print(f"Done. processed={posted_count}, all_platform_failures={total_failures}")
-    return 1 if total_failures > 0 else 0
+    failed = attempt_count > 0 and success_count == 0
+    print(f"Done. processed={posted_count}, attempts={attempt_count}, all_platform_failures={1 if failed else 0}")
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
