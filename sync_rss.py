@@ -4,7 +4,9 @@ import html
 import json
 import os
 import re
+import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -27,13 +29,37 @@ CATEGORY_TAG_MAP = {
     "köşe yazıları": "#KöşeYazısı",
 }
 
+THREADS_TOPIC_MAP = {
+    "spor": "Çankırı Spor",
+    "gündem": "Çankırı Haber",
+    "ekonomi": "Çankırı Ekonomi",
+    "eğitim": "Çankırı Eğitim",
+    "yaşam": "Çankırı Yaşam",
+    "kültür": "Çankırı Kültür",
+    "sağlık": "Çankırı Sağlık",
+    "asayiş": "Çankırı Haber",
+    "köşe yazıları": "Çankırı Gündem",
+}
+
 URL_REGEX = re.compile(r'https?://cankirim\.com\.tr/[^\s"<>]+', re.IGNORECASE)
 
 
-def norm_url(u: str) -> str:
+def unwrap_url(u: str) -> str:
     if not u:
         return ""
     u = html.unescape(u.strip())
+    parsed = urllib.parse.urlsplit(u)
+    if parsed.netloc.lower() in ("l.threads.net", "l.threads.com", "l.instagram.com", "l.facebook.com"):
+        qs = urllib.parse.parse_qs(parsed.query)
+        if qs.get("u"):
+            return html.unescape(qs["u"][0].strip())
+    return u
+
+
+def norm_url(u: str) -> str:
+    u = unwrap_url(u)
+    if not u:
+        return ""
     parsed = urllib.parse.urlsplit(u)
     scheme = (parsed.scheme or "https").lower()
     netloc = parsed.netloc.lower()
@@ -171,6 +197,63 @@ def get_facebook_recent_urls(page_id: str, token: str):
     return fb_name, urls
 
 
+def get_threads_recent_urls(user_id: str, token: str):
+    days_left = None
+    try:
+        dbg = http_json(
+            "https://graph.threads.net/debug_token?"
+            + urllib.parse.urlencode({"input_token": token, "access_token": token})
+        )
+        expires_at = (dbg.get("data") or {}).get("expires_at")
+        if expires_at:
+            days_left = (float(expires_at) - time.time()) / 86400.0
+            pat = os.environ.get("GH_SECRET_PAT", "").strip()
+            repo = os.environ.get("GITHUB_REPOSITORY", "").strip()
+            if 0 < days_left < 45 and pat and repo:
+                try:
+                    ref = http_json(
+                        "https://graph.threads.net/refresh_access_token?"
+                        + urllib.parse.urlencode({"grant_type": "th_refresh_token", "access_token": token})
+                    )
+                    new_tok = (ref.get("access_token") or "").strip()
+                    if new_tok:
+                        subprocess.run(
+                            ["gh", "secret", "set", "THREADS_ACCESS_TOKEN", "-R", repo],
+                            input=new_tok.encode("utf-8"),
+                            env={**os.environ, "GH_TOKEN": pat},
+                            check=True,
+                        )
+                        token = new_tok
+                        days_left = float(ref.get("expires_in", 5184000)) / 86400.0
+                        print("Threads token refreshed and saved to THREADS_ACCESS_TOKEN")
+                except Exception as exc:
+                    print(f"WARN Threads token refresh failed: {exc}")
+    except Exception as exc:
+        print(f"WARN Threads debug_token check failed: {exc}")
+
+    info = http_json(
+        f"https://graph.threads.net/v1.0/{urllib.parse.quote(user_id)}?"
+        + urllib.parse.urlencode({"fields": "id,username", "access_token": token})
+    )
+    th_username = info.get("username") or user_id
+    posts = http_json(
+        f"https://graph.threads.net/v1.0/{urllib.parse.quote(user_id)}/threads?"
+        + urllib.parse.urlencode({
+            "fields": "id,text,link_attachment_url,permalink",
+            "limit": "35",
+            "access_token": token,
+        })
+    )
+    urls = set()
+    for post in posts.get("data") or []:
+        la = unwrap_url(post.get("link_attachment_url") or "")
+        if la and "cankirim.com.tr" in la.lower():
+            urls.add(norm_url(la))
+        for m in URL_REGEX.findall(post.get("text") or ""):
+            urls.add(norm_url(m))
+    return th_username, days_left, token, urls
+
+
 def fetch_article_og(url: str, fallback_desc: str):
     og_desc = fallback_desc
     img_bytes = b""
@@ -306,6 +389,84 @@ def post_to_facebook(page_id: str, token: str, item: dict, og_desc: str, tags: l
     return res.get("id", "")
 
 
+def post_to_threads(user_id: str, token: str, item: dict, og_desc: str):
+    head = item["title"].strip()
+    desc = (og_desc or item["description"] or "").strip()
+    if desc and len(head) + 2 < 490:
+        avail = 490 - len(head) - 2
+        if avail > 30:
+            if len(desc) > avail:
+                desc = desc[: avail - 1].rstrip() + "…"
+            text = f"{head}\n\n{desc}"
+        else:
+            text = head[:490]
+    else:
+        text = head[:489].rstrip() + "…" if len(head) > 490 else head
+
+    topic_tag = (
+        "Çankırı FK"
+        if "çankırı fk" in item["title"].lower()
+        else THREADS_TOPIC_MAP.get(item["category"].strip().lower(), "Çankırı Haber")
+    )
+    fields = {
+        "media_type": "TEXT",
+        "text": text,
+        "link_attachment": item["link"],
+        "topic_tag": topic_tag,
+        "access_token": token,
+    }
+    uid_q = urllib.parse.quote(user_id)
+    try:
+        c_res = http_json(
+            f"https://graph.threads.net/v1.0/{uid_q}/threads",
+            method="POST",
+            payload=urllib.parse.urlencode(fields).encode("utf-8"),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=20,
+        )
+    except urllib.error.HTTPError as err:
+        if err.code == 400:
+            fields.pop("topic_tag", None)
+            c_res = http_json(
+                f"https://graph.threads.net/v1.0/{uid_q}/threads",
+                method="POST",
+                payload=urllib.parse.urlencode(fields).encode("utf-8"),
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                timeout=20,
+            )
+        else:
+            raise
+
+    creation_id = c_res["id"]
+    for _ in range(12):
+        st = http_json(
+            f"https://graph.threads.net/v1.0/{urllib.parse.quote(creation_id)}?"
+            + urllib.parse.urlencode({"fields": "status,error_message", "access_token": token}),
+            timeout=20,
+        )
+        status = st.get("status")
+        if status == "FINISHED":
+            break
+        if status in ("ERROR", "EXPIRED"):
+            raise RuntimeError(f"Threads container {status}: {st.get('error_message', st)}")
+        time.sleep(2)
+
+    pub = http_json(
+        f"https://graph.threads.net/v1.0/{uid_q}/threads_publish",
+        method="POST",
+        payload=urllib.parse.urlencode({"creation_id": creation_id, "access_token": token}).encode("utf-8"),
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        timeout=20,
+    )
+    post_id = pub["id"]
+    detail = http_json(
+        f"https://graph.threads.net/v1.0/{urllib.parse.quote(post_id)}?"
+        + urllib.parse.urlencode({"fields": "id,permalink", "access_token": token}),
+        timeout=20,
+    )
+    return detail.get("permalink") or post_id
+
+
 def main():
     dry_run = "--dry-run" in sys.argv[1:] or os.environ.get("DRY_RUN", "").lower() == "true"
     print(f"RSS Social Sync started (dry_run={dry_run})")
@@ -319,6 +480,8 @@ def main():
     masto_token = os.environ.get("MASTODON_ACCESS_TOKEN", "").strip()
     fb_page_id = os.environ.get("FACEBOOK_PAGE_ID", "").strip()
     fb_token = os.environ.get("FACEBOOK_PAGE_ACCESS_TOKEN", "").strip()
+    threads_user_id = os.environ.get("THREADS_USER_ID", "").strip()
+    threads_token = os.environ.get("THREADS_ACCESS_TOKEN", "").strip()
 
     bsky_jwt = bsky_did = None
     bsky_urls = set()
@@ -348,8 +511,18 @@ def main():
     else:
         print("Facebook skipped: missing credentials")
 
-    # Meta Threads Graph API placeholder hook for next step:
-    # if os.environ.get("THREADS_ACCESS_TOKEN"): ...
+    threads_ready = False
+    threads_urls = set()
+    if threads_user_id and threads_token:
+        try:
+            th_name, th_days, threads_token, threads_urls = get_threads_recent_urls(threads_user_id, threads_token)
+            threads_ready = True
+            days_note = f", {th_days:.1f}d left" if th_days is not None else ""
+            print(f"Threads connected (@{th_name}{days_note}): {len(threads_urls)} existing URLs detected")
+        except Exception as exc:
+            print(f"Threads connect ERROR: {exc}")
+    else:
+        print("Threads skipped: missing credentials")
 
     if not items:
         print("No eligible RSS items found.")
@@ -366,11 +539,15 @@ def main():
         need_bsky = bool(bsky_jwt) and item["norm_link"] not in bsky_urls
         need_masto = bool(masto_token) and item["norm_link"] not in masto_urls
         need_fb = fb_ready and item["norm_link"] not in fb_urls
-        if not need_bsky and not need_masto and not need_fb:
+        need_threads = threads_ready and item["norm_link"] not in threads_urls
+        if not need_bsky and not need_masto and not need_fb and not need_threads:
             continue
 
         tags = build_hashtags(item["title"], item["category"])
-        print(f"Pending item: {item['title']} | bsky={need_bsky} masto={need_masto} fb={need_fb} | tags={tags}")
+        print(
+            f"Pending item: {item['title']} | bsky={need_bsky} masto={need_masto} "
+            f"fb={need_fb} threads={need_threads} | tags={tags}"
+        )
 
         if dry_run:
             posted_count += 1
@@ -409,6 +586,16 @@ def main():
                 successes_for_item += 1
             except Exception as exc:
                 print(f"  Facebook ERROR: {exc}")
+
+        if need_threads:
+            attempts_for_item += 1
+            try:
+                th_link = post_to_threads(threads_user_id, threads_token, item, og_desc)
+                print(f"  Threads OK: {th_link}")
+                threads_urls.add(item["norm_link"])
+                successes_for_item += 1
+            except Exception as exc:
+                print(f"  Threads ERROR: {exc}")
 
         if attempts_for_item > 0 and successes_for_item == 0:
             total_failures += 1
