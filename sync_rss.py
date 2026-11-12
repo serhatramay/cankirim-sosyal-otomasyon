@@ -13,7 +13,7 @@ import urllib.request
 import xml.etree.ElementTree as ET
 
 RSS_URL = os.environ.get("RSS_URL", "https://cankirim.com.tr/rss.xml")
-MIN_PUBDATE_UTC = datetime.datetime(2026, 11, 12, 21, 30, 0, tzinfo=datetime.timezone.utc)
+MIN_PUBDATE_UTC = datetime.datetime(2026, 11, 12, 23, 10, 0, tzinfo=datetime.timezone.utc)
 MAX_POSTS_PER_RUN = 3
 USER_AGENT = "CankirimSosyalBot/1.0 (+https://cankirim.com.tr)"
 
@@ -42,6 +42,11 @@ THREADS_TOPIC_MAP = {
 }
 
 URL_REGEX = re.compile(r'https?://cankirim\.com\.tr/[^\s"<>]+', re.IGNORECASE)
+SKIP_DEATH_REGEX = re.compile(
+    r"\b(cansız\s+beden\w*|ölü\s+bulun\w*|hayatını\s+kaybet\w*|yaşamını\s+yitir\w*|"
+    r"vefat\s+et\w*|toprağa\s+veril\w*|cenaze\w*|intihar\w*)\b",
+    re.IGNORECASE,
+)
 
 
 def unwrap_url(u: str) -> str:
@@ -110,6 +115,8 @@ def fetch_rss_items():
         else:
             pub_dt = pub_dt.astimezone(datetime.timezone.utc)
         if pub_dt < MIN_PUBDATE_UTC:
+            continue
+        if SKIP_DEATH_REGEX.search(f"{title} {description}"):
             continue
         items.append({
             "title": title,
