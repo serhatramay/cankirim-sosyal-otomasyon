@@ -146,6 +146,31 @@ def get_mastodon_recent_urls(instance: str, token: str):
     return acct, urls
 
 
+def get_facebook_recent_urls(page_id: str, token: str):
+    info = http_json(
+        f"https://graph.facebook.com/v21.0/{urllib.parse.quote(page_id)}?"
+        + urllib.parse.urlencode({"fields": "name,username", "access_token": token})
+    )
+    fb_name = info.get("username") or info.get("name") or page_id
+    posts = http_json(
+        f"https://graph.facebook.com/v21.0/{urllib.parse.quote(page_id)}/published_posts?"
+        + urllib.parse.urlencode({
+            "fields": "id,message,attachments{unshimmed_url,url}",
+            "limit": "30",
+            "access_token": token,
+        })
+    )
+    urls = set()
+    for post in posts.get("data") or []:
+        for att in (post.get("attachments") or {}).get("data") or []:
+            u = att.get("unshimmed_url") or att.get("url")
+            if u and "cankirim.com.tr" in u.lower():
+                urls.add(norm_url(u))
+        for m in URL_REGEX.findall(post.get("message") or ""):
+            urls.add(norm_url(m))
+    return fb_name, urls
+
+
 def fetch_article_og(url: str, fallback_desc: str):
     og_desc = fallback_desc
     img_bytes = b""
@@ -261,6 +286,26 @@ def post_to_mastodon(instance: str, token: str, item: dict, og_desc: str, tags: 
     return res.get("url", "")
 
 
+def post_to_facebook(page_id: str, token: str, item: dict, og_desc: str, tags: list):
+    desc = (og_desc or item["description"] or "").strip()
+    tags_str = " ".join(tags)
+    title = item["title"].strip()
+    message = f"{title}\n\n{desc}\n\n{tags_str}" if desc else f"{title}\n\n{tags_str}"
+    body = urllib.parse.urlencode({
+        "message": message,
+        "link": item["link"],
+        "access_token": token,
+    }).encode("utf-8")
+    res = http_json(
+        f"https://graph.facebook.com/v21.0/{urllib.parse.quote(page_id)}/feed",
+        method="POST",
+        payload=body,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        timeout=20,
+    )
+    return res.get("id", "")
+
+
 def main():
     dry_run = "--dry-run" in sys.argv[1:] or os.environ.get("DRY_RUN", "").lower() == "true"
     print(f"RSS Social Sync started (dry_run={dry_run})")
@@ -272,6 +317,8 @@ def main():
     bsky_pass = os.environ.get("BLUESKY_APP_PASSWORD", "").strip()
     masto_instance = os.environ.get("MASTODON_INSTANCE", "https://mastodon.social").strip()
     masto_token = os.environ.get("MASTODON_ACCESS_TOKEN", "").strip()
+    fb_page_id = os.environ.get("FACEBOOK_PAGE_ID", "").strip()
+    fb_token = os.environ.get("FACEBOOK_PAGE_ACCESS_TOKEN", "").strip()
 
     bsky_jwt = bsky_did = None
     bsky_urls = set()
@@ -289,8 +336,19 @@ def main():
     else:
         print("Mastodon skipped: missing credentials")
 
-    # Meta Graph API placeholder hooks for next step:
-    # if os.environ.get("FACEBOOK_PAGE_ACCESS_TOKEN"): ...
+    fb_ready = False
+    fb_urls = set()
+    if fb_page_id and fb_token:
+        try:
+            fb_name, fb_urls = get_facebook_recent_urls(fb_page_id, fb_token)
+            fb_ready = True
+            print(f"Facebook connected (@{fb_name}): {len(fb_urls)} existing URLs detected")
+        except Exception as exc:
+            print(f"Facebook connect ERROR: {exc}")
+    else:
+        print("Facebook skipped: missing credentials")
+
+    # Meta Threads Graph API placeholder hook for next step:
     # if os.environ.get("THREADS_ACCESS_TOKEN"): ...
 
     if not items:
@@ -307,11 +365,12 @@ def main():
 
         need_bsky = bool(bsky_jwt) and item["norm_link"] not in bsky_urls
         need_masto = bool(masto_token) and item["norm_link"] not in masto_urls
-        if not need_bsky and not need_masto:
+        need_fb = fb_ready and item["norm_link"] not in fb_urls
+        if not need_bsky and not need_masto and not need_fb:
             continue
 
         tags = build_hashtags(item["title"], item["category"])
-        print(f"Pending item: {item['title']} | bsky={need_bsky} masto={need_masto} | tags={tags}")
+        print(f"Pending item: {item['title']} | bsky={need_bsky} masto={need_masto} fb={need_fb} | tags={tags}")
 
         if dry_run:
             posted_count += 1
@@ -340,6 +399,16 @@ def main():
                 successes_for_item += 1
             except Exception as exc:
                 print(f"  Mastodon ERROR: {exc}")
+
+        if need_fb:
+            attempts_for_item += 1
+            try:
+                fb_post_id = post_to_facebook(fb_page_id, fb_token, item, og_desc, tags)
+                print(f"  Facebook OK: {fb_post_id}")
+                fb_urls.add(item["norm_link"])
+                successes_for_item += 1
+            except Exception as exc:
+                print(f"  Facebook ERROR: {exc}")
 
         if attempts_for_item > 0 and successes_for_item == 0:
             total_failures += 1
